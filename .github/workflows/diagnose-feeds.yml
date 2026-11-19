@@ -1,0 +1,44 @@
+# Quick check of each tender portal from GitHub's servers: shows status, size and number of
+# releases for a few request variants. Takes about 3 minutes. Safe to run any time.
+name: Diagnose feeds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Probe portals
+        run: |
+          FROM=$(date -u -d '-120 days' +%Y-%m-%dT00:00:00); NOW=$(date -u +%Y-%m-%dT%H:%M:%S); M=$(date -u +%m-%Y)
+          probe () {
+            echo "=== $1"
+            code=$(curl -sS -o /tmp/out.json -w "%{http_code} %{size_download}B %{time_total}s" --max-time 90 -H "Accept: application/json" "$1" 2>/tmp/err.txt) || true
+            echo "status: $code $(cat /tmp/err.txt)"
+            python3 -c "import json;d=json.load(open('/tmp/out.json'));r=d.get('releases') if isinstance(d,dict) else None;print('keys:',list(d)[:8] if isinstance(d,dict) else type(d).__name__,'| releases:',len(r) if r is not None else None,'| next:',(d.get('links') or {}).get('next','')[:150] if isinstance(d,dict) else '')" 2>/dev/null || head -c 300 /tmp/out.json; echo
+            sleep 11
+          }
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&stages=tender"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&stages=planning,tender"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&stages=tender&updatedFrom=$FROM"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&stages=tender&updatedFrom=$FROM&updatedTo=$NOW"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&updatedFrom=$FROM&updatedTo=$NOW"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=100&stages=tender&updatedFrom=$FROM&updatedTo=$NOW"
+          probe "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages?limit=5&stages=award&updatedFrom=2024-03-01T00:00:00&updatedTo=2024-03-31T23:59:59"
+          probe "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search?publishedFrom=$FROM&publishedTo=$NOW&stages=tender&limit=100"
+          probe "https://api.sell2wales.gov.wales/v1/Notices?dateFrom=$M&noticeType=2&outputType=0&locale=2057"
+          probe "https://api.sell2wales.gov.wales/v1/Notices?dateFrom=$M&noticeType=2&outputType=0"
+          probe "https://api.sell2wales.gov.wales/v1/Notices?noticeType=2&outputType=0&locale=2057"
+          probe "https://api.publiccontractsscotland.gov.uk/v1/Notices?dateFrom=$M&noticeType=2&outputType=0"
+          echo "=== Scotland TLS detail"
+          curl -sv -o /dev/null --max-time 30 "https://api.publiccontractsscotland.gov.uk/v1/Notices" 2>&1 | grep -iE "SSL|certificate|issuer|subject|expire|verify|error" | head -20
+          echo "=== Scotland cert chain"
+          echo | openssl s_client -connect api.publiccontractsscotland.gov.uk:443 -servername api.publiccontractsscotland.gov.uk -showcerts 2>/dev/null | grep -E "^ *[0-9] s:|i:|Verify return" | head -12
+          echo "=== Python requests to Scotland"
+          python3 -c "import requests;r=requests.get('https://api.publiccontractsscotland.gov.uk/v1/Notices',timeout=60);print(r.status_code,len(r.content))" 2>&1 | tail -3
