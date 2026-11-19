@@ -68,7 +68,7 @@ Until this step is done, the page is reachable by anyone who knows the address. 
 ## Renewals (contracts ending soon)
 The **Renewals** filter lists awarded contracts for Fused services that end in the next 18 months, with the current supplier, value and end date. Contracts ending in 6–12 months are marked **Prime window**. Use **Pursue / Ignore** to track which ones to chase.
 - Needs the `SUPABASE_SERVICE_KEY` repo secret (the Supabase **secret** key). Never put it in the code.
-- **History, one-off:** go to **Actions → Renewals backfill (one-off) → Run workflow** with the boxes left blank. Each run scans up to about 5 hours of past award notices (newest month first, back to 2021) and remembers where it stopped. Run it again until the log says `Backfill already complete`.
+- **History, one-off:** the **Renewals backfill (one-off)** workflow scans past award notices (newest month first, back to 2021), up to about 5 hours per run, and runs itself every 6 hours, carrying on where it stopped, until the log says `Backfill already complete`. You can also start it from **Actions → Run workflow**.
 - After that, the daily refresh adds new award notices automatically.
 
 ## Day to day

@@ -157,7 +157,7 @@ def month_list(n):
     return out
 
 
-def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None, pause=0.4):
+def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None, pause=0.4, date_stop=True):
     """Walk the API's own paging links from newest to oldest until releases are older than cutoff."""
     url, params, pages = base, first_params, 0
     while pages < max_pages and (deadline is None or time.time() < deadline):
@@ -179,7 +179,9 @@ def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None
             if info is not None: info["stop"] = "end of feed"
             return
         dates = [r.get("date", "") for r in rels if r.get("date")]
-        if dates and max(dates)[:10] < cutoff.strftime("%Y-%m-%d"):
+        # Contracts Finder: stop once a whole page is older than the look-back. Find a Tender filters by
+        # update date itself, and an old notice updated recently would stop the walk too early, so skip it there.
+        if date_stop and dates and max(dates)[:10] < cutoff.strftime("%Y-%m-%d"):
             if info is not None: info["stop"] = "reached look-back date"
             return                       # whole page older than the look-back
         url, params = nxt, None
@@ -448,7 +450,8 @@ def scan_awards(session, frm, to, now, deadline=None, errors=None, infos=None):
     for label, base, params, portal, pause in feeds:
         n, info = 0, (infos.setdefault(label, {}) if infos is not None else {})
         try:
-            for rel in walk_feed(base, params, session, frm, deadline=deadline, info=info, pause=pause):
+            for rel in walk_feed(base, params, session, frm, deadline=deadline, info=info, pause=pause,
+                                 date_stop=portal != "Find a Tender"):
                 n += 1
                 try:
                     for row in renewals_from(rel, portal, now):
@@ -650,8 +653,9 @@ def run(days, outdir):
         info = infos.setdefault(label, {})
         n0 = scanned
         try:
-            pause = 10.5 if portal == "Find a Tender" else 0.4   # Find a Tender: max 12 requests per 2 minutes
-            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info, pause=pause):
+            fts = portal == "Find a Tender"
+            pause = 10.5 if fts else 0.4   # Find a Tender: max 12 requests per 2 minutes
+            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info, pause=pause, date_stop=not fts):
                 consider(rel, portal)
             ok += 1
         except Exception as e:

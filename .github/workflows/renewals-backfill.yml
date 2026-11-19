@@ -1,12 +1,15 @@
 # One-off history scan for the Renewals list.
 # Reads past award notices (Find a Tender + Contracts Finder), newest month first, and saves contracts that
 # end in the future to Supabase. Each run does up to ~5 hours, saves after every month, and the next run
-# carries on where it stopped. Run it until the log says "Backfill already complete".
-# The daily refresh then keeps the list up to date by itself.
+# carries on where it stopped. It also runs itself every 6 hours until the log says
+# "Backfill already complete" (after that each scheduled run exits in seconds - you can disable it then).
+# The daily refresh keeps the list up to date by itself.
 
 name: Renewals backfill (one-off)
 
 on:
+  schedule:
+    - cron: "41 */6 * * *"     # every 6 hours: carries on where the last run stopped; exits in seconds once complete
   workflow_dispatch:
     inputs:
       start:
@@ -22,7 +25,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: tender-refresh          # never runs at the same time as the daily refresh (shared rate limits)
+  group: renewals-backfill       # own queue, so it never blocks the daily refresh (both pace Find a Tender requests)
   cancel-in-progress: false
 
 jobs:
@@ -38,8 +41,8 @@ jobs:
       - name: Scan past award notices into Supabase
         env:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          START: ${{ inputs.start }}
-          STOP: ${{ inputs.stop }}
+          START: ${{ inputs.start || '' }}
+          STOP: ${{ inputs.stop || '2021-01' }}
         run: |
           if [ -n "$START" ]; then
             python fetch_and_score.py --backfill-renewals --start "$START" --stop "${STOP:-2021-01}"
