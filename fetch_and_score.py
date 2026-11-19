@@ -26,6 +26,8 @@ S2W_BASE = "https://api.sell2wales.gov.wales/v1/Notices"   # .gov.wales (the old
 # down and every read/write needs the team passcode (see supabase_setup.sql).
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://xwyxgjxeorfuuueyqrte.supabase.co")  # Supabase project "Tenders"
 SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY", "sb_publishable_eJpp7AcdfQ8BT8HIErSXEg_IEXUBBYx")  # public by design
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")  # GitHub secret - private; used only by the job
+RENEWAL_MONTHS = 18          # renewals shown on the dashboard: contracts ending within this many months
 UA = {"Accept": "application/json", "User-Agent": "FUSED-Tender-Intelligence/1.0"}
 
 KW_HIGH = ["eicr", "electrical installation condition report", "electrical condition report",
@@ -188,12 +190,15 @@ def parse_dt(s):
         return None
 
 
-def score(rel, portal, now):
+def match(rel):
+    """Does this notice concern Fused services? Returns (tender, title, keyword points, evidence) or None."""
     t = rel.get("tender") or {}
     title = t.get("title") or ""
     parts = [title, t.get("description") or "", rel.get("description") or ""]
     for lot in t.get("lots", []) or []:
         parts += [lot.get("title") or "", lot.get("description") or ""]
+    for aw in rel.get("awards", []) or []:               # award notices describe the contract here
+        parts += [aw.get("title") or "", aw.get("description") or ""]
     text = "\n".join(parts).lower()
 
     cpvs = []
@@ -235,6 +240,15 @@ def score(rel, portal, now):
     for code, d in cpvs:
         if code in CPV_HIGH or code in CPV_MED:
             ev.append(f"CPV {code} {d}"); kw = min(30, kw + 2)
+
+    return t, title, kw, ev
+
+
+def score(rel, portal, now):
+    m = match(rel)
+    if not m:
+        return None
+    t, title, kw, ev = m
 
     tags = rel.get("tag") or ["tender"]
     if "tender" in tags or "tenderUpdate" in tags:
@@ -304,10 +318,12 @@ const sync=document.getElementById('sync'), login=document.getElementById('login
 function status(t,bad){sync.textContent=t;sync.className=bad?'bad':'';}
 function fmt(at){if(!at)return '';const d=new Date(at);return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});}
 function paint(){cards.forEach(c=>{const e=store[c.dataset.id];c.dataset.d=e?e.d:'';
-  c.querySelector('.who').textContent=e&&e.by?(e.d==='bid'?'Bid':'No Bid')+' by '+e.by+(e.at?', '+fmt(e.at):''):'';});apply();}
+  const rn=c.dataset.s==='renewal';
+  c.querySelector('.who').textContent=e&&e.by?(e.d==='bid'?(rn?'Pursue':'Bid'):(rn?'Ignore':'No Bid'))+' by '+e.by+(e.at?', '+fmt(e.at):''):'';});apply();}
 function apply(){const q=document.getElementById('q').value.toLowerCase();let b=0,n=0,r=0,v=0;
- cards.forEach(c=>{const d=c.dataset.d||'';if(d==='bid'){b++;v+=+c.dataset.v||0}else if(d==='nobid')n++;else r++;
-  const ok=(fShow==='all'||c.dataset.p===fShow||c.dataset.s===fShow)&&(fDec==='all'||d===fDec)&&(!q||c.textContent.toLowerCase().includes(q));
+ cards.forEach(c=>{const d=c.dataset.d||'',rn=c.dataset.s==='renewal';
+  if(!rn){if(d==='bid'){b++;v+=+c.dataset.v||0}else if(d==='nobid')n++;else r++;}
+  const ok=(fShow==='all'?!rn:(c.dataset.p===fShow||c.dataset.s===fShow))&&(fDec==='all'||d===fDec)&&(!q||c.textContent.toLowerCase().includes(q));
   c.style.display=ok?'':'none';});
  sBid.textContent=b;sNo.textContent=n;sRev.textContent=r;sVal.textContent='£'+Math.round(v).toLocaleString('en-GB');}
 async function rpc(fn,body){const h={'apikey':CFG.key,'Content-Type':'application/json'};
@@ -340,7 +356,144 @@ load(); setInterval(load,30000); document.addEventListener('visibilitychange',()
 """
 
 
-def render(rows, stats, updated, diag=None):
+# ---------------------------------------------------------------- renewals (contracts ending soon)
+def sb_headers(extra=None):
+    h = {"apikey": SUPABASE_SERVICE_KEY, "Content-Type": "application/json"}
+    if SUPABASE_SERVICE_KEY.startswith("eyJ"):
+        h["Authorization"] = "Bearer " + SUPABASE_SERVICE_KEY
+    h.update(extra or {})
+    return h
+
+
+def sb_upsert(table, rows, conflict="id"):
+    for i in range(0, len(rows), 500):
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{table}?on_conflict={conflict}",
+                          headers=sb_headers({"Prefer": "resolution=merge-duplicates,return=minimal"}),
+                          data=json.dumps(rows[i:i + 500], default=str), timeout=60)
+        if r.status_code >= 300:
+            raise RuntimeError(f"Supabase {table} upsert failed: HTTP {r.status_code} {r.text[:200]}")
+
+
+def sb_select(path):
+    r = requests.get(f"{SUPABASE_URL}/rest/v1/{path}", headers=sb_headers(), timeout=60)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Supabase read failed: HTTP {r.status_code} {r.text[:200]}")
+    return r.json()
+
+
+def notice_url(rel, portal):
+    if portal == "Find a Tender":
+        return f"https://www.find-tender.service.gov.uk/Notice/{rel.get('id')}"
+    t = rel.get("tender") or {}
+    for d in (t.get("documents") or []) + (((rel.get("awards") or [{}])[0]).get("documents") or []):
+        if d.get("url"):
+            return d["url"]
+    return ""
+
+
+def renewals_from(rel, portal, now):
+    """Turn an award notice for a Fused-type service into renewal rows (one per award with an end date)."""
+    if not (rel.get("awards") or rel.get("contracts")):
+        return []
+    m = match(rel)
+    if not m:
+        return []
+    t, title, kw, ev = m
+    buyer = (rel.get("buyer") or {}).get("name", "")
+    contracts = rel.get("contracts") or []
+    awards = rel.get("awards") or [{}]
+    contact = ""
+    for p in rel.get("parties", []) or []:
+        if "buyer" in (p.get("roles") or []):
+            cp = p.get("contactPoint") or {}
+            contact = " / ".join(x for x in (cp.get("name"), cp.get("email"), cp.get("telephone")) if x)
+            break
+    out = []
+    for aw in awards:
+        if (aw.get("status") or "") in ("cancelled", "unsuccessful"):
+            continue
+        ct = next((c for c in contracts if c.get("awardID") == aw.get("id")), contracts[0] if contracts else {})
+        per = aw.get("contractPeriod") or ct.get("period") or t.get("contractPeriod") or {}
+        start, end = parse_dt(per.get("startDate") or ""), parse_dt(per.get("endDate") or "")
+        if not end and start and per.get("durationInDays"):
+            end = start + timedelta(days=int(per["durationInDays"]))
+        if not end or end < now - timedelta(days=30):
+            continue
+        val = ((aw.get("value") or {}).get("amount") or (ct.get("value") or {}).get("amount")
+               or (t.get("value") or {}).get("amount"))
+        sup = ", ".join(x.get("name", "") for x in (aw.get("suppliers") or []) if x.get("name"))
+        rid = (rel.get("ocid") or "") + (f"/{aw.get('id')}" if len(awards) > 1 and aw.get("id") else "")
+        out.append(dict(id=rid, ocid=rel.get("ocid"), title=(aw.get("title") or title)[:500], buyer=buyer[:300],
+                        supplier=sup[:300], value_gbp=val,
+                        contract_start=start.date().isoformat() if start else None,
+                        contract_end=end.date().isoformat(),
+                        awarded=(parse_dt(aw.get("date") or rel.get("date") or "") or now).date().isoformat(),
+                        portal=portal, url=notice_url(rel, portal), evidence="; ".join(dict.fromkeys(ev))[:300],
+                        contact=contact[:300], updated_at=now.isoformat()))
+    return out
+
+
+def scan_awards(session, frm, to, now, deadline=None, errors=None, infos=None):
+    """Walk award notices published/updated between frm and to on Find a Tender and Contracts Finder."""
+    found, counts = {}, {}
+    f_s, t_s = frm.strftime("%Y-%m-%dT%H:%M:%S"), to.strftime("%Y-%m-%dT%H:%M:%S")
+    feeds = [("Find a Tender awards", FTS_BASE,
+              {"limit": 100, "stages": "award", "updatedFrom": f_s, "updatedTo": t_s}, "Find a Tender", 10.5),
+             ("Contracts Finder awards", CF_BASE,
+              {"publishedFrom": f_s, "publishedTo": t_s, "stages": "award", "limit": 100}, "Contracts Finder", 0.4)]
+    for label, base, params, portal, pause in feeds:
+        n, info = 0, (infos.setdefault(label, {}) if infos is not None else {})
+        try:
+            for rel in walk_feed(base, params, session, frm, deadline=deadline, info=info, pause=pause):
+                n += 1
+                try:
+                    for row in renewals_from(rel, portal, now):
+                        found[row["id"]] = row
+                except Exception as e:
+                    if errors is not None and len(errors) < 40:
+                        errors.append(f"renewal parse error on {rel.get('id')}: {e}")
+        except Exception as e:
+            if errors is not None:
+                errors.append(f"{label} {f_s[:10]}..{t_s[:10]}: {str(e)[:200]}")
+            print(f"  {label} FAILED: {e}", file=sys.stderr)
+        counts[label] = n
+        print(f"  {label} {f_s[:10]}..{t_s[:10]}: {n} award notices, {len(found)} renewals so far", file=sys.stderr)
+    return list(found.values()), counts
+
+
+def backfill_renewals(start=None, stop="2021-01"):
+    """One-off history scan, newest month first. Saves after every month so a later run can resume."""
+    if not SUPABASE_SERVICE_KEY:
+        sys.exit("SUPABASE_SERVICE_KEY is not set - add it as a GitHub secret first.")
+    now = datetime.now(timezone.utc)
+    if not start:
+        st = sb_select("app_state?key=eq.backfill_next&select=value")
+        start = st[0]["value"] if st else now.strftime("%Y-%m")
+    if start == "done":
+        print("Backfill already complete.", file=sys.stderr)
+        return
+    deadline = time.time() + 5 * 3600
+    s = requests.Session()
+    y, mth = map(int, start.split("-"))
+    total = 0
+    while f"{y:04d}-{mth:02d}" >= stop:
+        if time.time() > deadline - 20 * 60:
+            print(f"Time limit reached - next run resumes at {y:04d}-{mth:02d}", file=sys.stderr)
+            break
+        frm = datetime(y, mth, 1, tzinfo=timezone.utc)
+        to = datetime(y + (mth == 12), mth % 12 + 1, 1, tzinfo=timezone.utc) - timedelta(seconds=1)
+        rows, _ = scan_awards(s, frm, min(to, now), now, deadline=deadline)
+        if rows:
+            sb_upsert("renewals", rows)
+        total += len(rows)
+        y, mth = (y - 1, 12) if mth == 1 else (y, mth - 1)
+        nxt = f"{y:04d}-{mth:02d}" if f"{y:04d}-{mth:02d}" >= stop else "done"
+        sb_upsert("app_state", [dict(key="backfill_next", value=nxt, updated_at=now.isoformat())], conflict="key")
+        print(f"Month {frm:%Y-%m} done: {len(rows)} renewals saved (total {total}). Next: {nxt}", file=sys.stderr)
+    print(f"Backfill finished this run: {total} renewals saved.", file=sys.stderr)
+
+
+def render(rows, stats, updated, diag=None, renewals=None):
     E = html.escape
     def money(v): return f"£{v:,.0f}" if v else "not stated"
     cards = []
@@ -355,6 +508,24 @@ def render(rows, stats, updated, diag=None):
 {f'<div class="ev"><b>Buyer contact:</b> {E(r["contact"])}</div>' if r['contact'] else ''}
 <div class="bottom"><div class="src"><a href="{E(r['url'])}" target="_blank" rel="noopener">Open source notice &#8599;</a></div>
 <div class="decide"><span class="who"></span><span class="dl">Decision:</span><button class="db bid" data-set="bid">Bid</button><button class="db nobid" data-set="nobid">No Bid</button></div></div></div>""")
+    today = datetime.now(timezone.utc).date()
+    for r in renewals or []:
+        try:
+            end = datetime.fromisoformat(str(r["contract_end"])[:10]).date()
+        except Exception:
+            continue
+        months = max(0, round((end - today).days / 30.4))
+        win, wcls = (("Prime window", "prime") if 6 <= months <= 12 else
+                     ("Ending soon", "soon") if months < 6 else ("Early sight", "early"))
+        contact = f'<div class="ev"><b>Buyer contact:</b> {E(r["contact"])}</div>' if r.get("contact") else ""
+        cards.append(f"""<div class="card renewal" data-p="R" data-s="renewal" data-id="renewal:{E(str(r['id']))}" data-d="" data-v="{r.get('value_gbp') or 0}">
+<div class="top"><div><span class="badge R">RENEWAL</span><span class="win {wcls}">{win}</span></div>
+<div class="meta">Contract ends: <b>{end:%d %b %Y}</b> (in {months} months) &middot; Value: <b>{money(r.get('value_gbp'))}</b></div></div>
+<div class="title">{E(r.get('title') or '')}</div>
+<div class="buyer">{E(r.get('buyer') or '')} &middot; Current supplier: {E(r.get('supplier') or 'not stated')} &middot; Awarded {E(str(r.get('awarded') or ''))} &middot; {E(r.get('portal') or '')}</div>
+<div class="ev"><b>Evidence:</b> {E(r.get('evidence') or '')}</div>
+{contact}<div class="bottom"><div class="src"><a href="{E(r.get('url') or '')}" target="_blank" rel="noopener">Open award notice &#8599;</a></div>
+<div class="decide"><span class="who"></span><span class="dl">Decision:</span><button class="db bid" data-set="bid">Pursue</button><button class="db nobid" data-set="nobid">Ignore</button></div></div></div>""")
     body = "\n".join(cards) or '<p>No matching opportunities in this window.</p>'
     diag_html = ""
     if diag:
@@ -395,6 +566,8 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 .who{{font-size:12px;color:var(--m);margin-right:6px}}#sync{{font-size:12px;color:#1e8449;align-self:center}}#sync.bad{{color:#a13a1a}}
 .login{{display:none;gap:8px;align-items:center;flex-wrap:wrap;background:#fff8f1;border:1px solid #f3c9a8;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px}}
 .login input{{padding:6px 12px;border:1px solid var(--b);border-radius:20px;font-size:13px}}.login button{{background:var(--navy);color:#fff;border:0;border-radius:20px;padding:7px 16px;cursor:pointer}}.login span{{color:var(--m);font-size:12px}}
+.R{{background:#6c3fb5}}.win{{margin-left:8px;font-size:11px;font-weight:700;border-radius:20px;padding:2px 8px}}
+.win.prime{{color:#1e6b3a;background:#dff3e6}}.win.soon{{color:#a13a1a;background:#fdecdf}}.win.early{{color:#5c6b7a;background:#eef1f4}}
 .frow{{margin-bottom:10px}}.frow .fl{{font-size:12px;color:var(--m);text-transform:uppercase;margin-right:8px}}.foot{{font-size:12.5px;color:var(--m);margin-top:30px;line-height:1.6}}</style></head><body>
 <header><h1>FUSED Tender Intelligence</h1><p>PAT, EICR, fixed wire, emergency lighting, EV inspection, remedials, installations, voltage optimisation and electrical maintenance opportunities from Find a Tender, Contracts Finder, Public Contracts Scotland and Sell2Wales. Updated daily. Last refresh: {updated}.</p></header>
 <div class="wrap"><div class="stats">
@@ -403,6 +576,7 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 <div class="stat"><div class="n">{stats['P2']}</div><div class="l">P2</div></div>
 <div class="stat"><div class="n">{stats['tender']}</div><div class="l">Live tenders</div></div>
 <div class="stat"><div class="n">{stats['planning']}</div><div class="l">Pre-market</div></div>
+<div class="stat"><div class="n">{len(renewals or [])}</div><div class="l">Renewals ({RENEWAL_MONTHS} mo)</div></div>
 <div class="stat"><div class="n">{stats['scanned']}</div><div class="l">Notices scanned</div></div></div>
 <div class="summary"><div class="it"><div class="n bidc" id="sBid">0</div><div class="l">Bid</div></div>
 <div class="it"><div class="n nobidc" id="sNo">0</div><div class="l">No Bid</div></div>
@@ -410,7 +584,7 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 <div class="it"><div class="n bidc" id="sVal">&pound;0</div><div class="l">Bid pipeline value</div></div>
 <div class="act"><span id="sync"></span><button id="signout" title="Forget the passcode on this device">Sign out</button><button id="expCsv">CSV with decisions</button></div></div>
 <div id="login" class="login"><b>Team sign-in</b><input id="lwho" placeholder="Your name (e.g. Maaz)"><input id="lpass" type="password" placeholder="Team passcode"><button id="signin">Sign in</button><span>Decisions are shared with everyone who has the passcode.</span></div>
-<div class="filters"><div class="frow"><span class="fl">Show</span><input id="q" placeholder="Search buyer or title" style="padding:6px 12px;border:1px solid #dfe4ea;border-radius:20px;margin-right:10px;font-size:13px;width:220px"><button class="on" data-f="all">All</button><button data-f="P1">P1</button><button data-f="P2">P2</button><button data-f="tender">Live tenders</button><button data-f="planning">Pre-market</button> <a href="opportunities.csv" style="font-size:13px;margin-left:10px">Download CSV</a></div>
+<div class="filters"><div class="frow"><span class="fl">Show</span><input id="q" placeholder="Search buyer or title" style="padding:6px 12px;border:1px solid #dfe4ea;border-radius:20px;margin-right:10px;font-size:13px;width:220px"><button class="on" data-f="all">All</button><button data-f="P1">P1</button><button data-f="P2">P2</button><button data-f="tender">Live tenders</button><button data-f="planning">Pre-market</button><button data-f="renewal">Renewals</button> <a href="opportunities.csv" style="font-size:13px;margin-left:10px">Download CSV</a></div>
 <div class="frow" id="dfil"><span class="fl">Decision</span><button class="on" data-g="all">All</button><button data-g="bid">Bid</button><button data-g="nobid">No Bid</button><button data-g="">To review</button></div></div>
 <div id="cards">{body}</div>
 {diag_html}<div class="foot">Score (0-100) = service match (30) + value (20) + stage, pre-market scores higher (20) + buyer sector fit (15) + deadline urgency (15). Both source APIs filter only by stage and date, so every notice is scanned and matched locally. Always check the source notice before acting.</div></div>
@@ -523,6 +697,24 @@ def run(days, outdir):
                               result="matched - shown above" if matched else "fetched but not matched/closed by filters"))
         except Exception as e:
             known.append(dict(id=nid, title="", tags="", result=f"could not fetch: {str(e)[:80]}"))
+    # renewals: add award notices from the last 3 days, then read everything ending in the next RENEWAL_MONTHS
+    renewals = []
+    if SUPABASE_SERVICE_KEY:
+        try:
+            new, rc = scan_awards(s, now - timedelta(days=3), now, now, deadline=time.time() + 30 * 60,
+                                  errors=errors, infos=infos)
+            counts.update(rc)
+            if new:
+                sb_upsert("renewals", new)
+            horizon = (now + timedelta(days=int(RENEWAL_MONTHS * 30.4))).date().isoformat()
+            renewals = sb_select(f"renewals?select=*&contract_end=gte.{now.date().isoformat()}"
+                                 f"&contract_end=lte.{horizon}&order=contract_end.asc&limit=3000")
+            print(f"Renewals: {len(new)} new/updated, {len(renewals)} ending within {RENEWAL_MONTHS} months", file=sys.stderr)
+        except Exception as e:
+            errors.append(f"Renewals: {str(e)[:200]}")
+            print(f"  Renewals FAILED: {e}", file=sys.stderr)
+    else:
+        errors.append("Renewals off: add the SUPABASE_SERVICE_KEY secret in GitHub")
     rows = [v[1] for v in best.values()]
     if ok == 0 or scanned == 0:
         sys.exit("No data retrieved - leaving previous site untouched.")
@@ -532,17 +724,27 @@ def run(days, outdir):
                  scanned=scanned)
     os.makedirs(outdir, exist_ok=True)
     updated = now.strftime("%d %b %Y %H:%M UTC")
-    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, errors=errors, infos=infos, known=known, watch=sorted(watch, key=lambda w: w["date"], reverse=True))))
+    open(os.path.join(outdir, "index.html"), "w", encoding="utf-8").write(render(rows, stats, updated, dict(counts=counts, failed=failed, errors=errors, infos=infos, known=known, watch=sorted(watch, key=lambda w: w["date"], reverse=True)), renewals))
     json.dump(dict(updated=updated, stats=stats, rows=rows), open(os.path.join(outdir, "data.json"), "w"), indent=1)
     with open(os.path.join(outdir, "opportunities.csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["priority"])
         w.writeheader(); w.writerows(rows)
-    print(f"Done: {len(rows)} matches from {scanned} notices -> {outdir}", file=sys.stderr)
+    with open(os.path.join(outdir, "renewals.csv"), "w", newline="", encoding="utf-8") as fh:
+        cols = ["contract_end", "buyer", "title", "supplier", "value_gbp", "contract_start", "awarded", "portal", "url", "contact", "evidence"]
+        w = csv.DictWriter(fh, fieldnames=cols, extrasaction="ignore")
+        w.writeheader(); w.writerows(renewals)
+    print(f"Done: {len(rows)} matches from {scanned} notices, {len(renewals)} renewals -> {outdir}", file=sys.stderr)
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=45)
     ap.add_argument("--out", default="site")
+    ap.add_argument("--backfill-renewals", action="store_true", help="one-off scan of past award notices into Supabase")
+    ap.add_argument("--start", help="backfill: newest month to scan, YYYY-MM (default: resume where the last run stopped)")
+    ap.add_argument("--stop", default="2021-01", help="backfill: oldest month to scan, YYYY-MM")
     a = ap.parse_args()
-    run(a.days, a.out)
+    if a.backfill_renewals:
+        backfill_renewals(a.start, a.stop)
+    else:
+        run(a.days, a.out)

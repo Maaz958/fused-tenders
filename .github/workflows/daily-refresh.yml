@@ -4,6 +4,7 @@
 #
 # Repo secrets needed (Settings > Secrets and variables > Actions):
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID publishing to Cloudflare Pages
+#   SUPABASE_SERVICE_KEY                        saving / reading the renewals list
 
 name: Daily tender refresh
 
@@ -40,6 +41,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Fetch, score and build dashboard
+        env:
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}   # renewals (contracts ending soon)
         run: python fetch_and_score.py --days 45 --out site
         # If no data comes back, the script exits with an error and nothing is published,
         # so yesterday's dashboard stays live.

@@ -11,6 +11,7 @@ A private daily dashboard of electrical compliance tenders (PAT, EICR, fixed wir
 | `fetch_and_score.py` | Fetches, scores and builds the dashboard |
 | `.github/workflows/daily-refresh.yml` | The daily job: runs the script, publishes to Cloudflare |
 | `supabase_setup.sql` | Database setup for Bid / No Bid decisions (already run) |
+| `.github/workflows/renewals-backfill.yml` | One-off scan of past award notices for the Renewals list |
 | `requirements.txt` | Python packages |
 
 ---
@@ -63,6 +64,12 @@ In the repo, go to **Settings → Secrets and variables → Actions → New repo
 Until this step is done, the page is reachable by anyone who knows the address. It only contains public tender notices, and Bid / No Bid decisions still need the passcode.
 
 ---
+
+## Renewals (contracts ending soon)
+The **Renewals** filter lists awarded contracts for Fused services that end in the next 18 months, with the current supplier, value and end date. Contracts ending in 6–12 months are marked **Prime window**. Use **Pursue / Ignore** to track which ones to chase.
+- Needs the `SUPABASE_SERVICE_KEY` repo secret (the Supabase **secret** key). Never put it in the code.
+- **History, one-off:** go to **Actions → Renewals backfill (one-off) → Run workflow** with the boxes left blank. Each run scans up to about 5 hours of past award notices (newest month first, back to 2021) and remembers where it stopped. Run it again until the log says `Backfill already complete`.
+- After that, the daily refresh adds new award notices automatically.
 
 ## Day to day
 - **Opening the site:** enter your email, then the code Cloudflare sends you. You stay signed in for 24 hours by default (you can change this in the Access application settings).
