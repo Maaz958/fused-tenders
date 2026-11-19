@@ -21,7 +21,7 @@ import requests
 FTS_BASE = "https://www.find-tender.service.gov.uk/api/1.0/ocdsReleasePackages"
 CF_BASE = "https://www.contractsfinder.service.gov.uk/Published/Notices/OCDS/Search"
 PCS_BASE = "https://api.publiccontractsscotland.gov.uk/v1/Notices"
-S2W_BASE = "https://api.sell2wales.gov.uk/v1/Notices"
+S2W_BASE = "https://api.sell2wales.gov.wales/v1/Notices"   # .gov.wales (the old .gov.uk address fails SSL)
 # Shared Bid / No Bid store (Supabase). Both values are safe to publish: the table is locked
 # down and every read/write needs the team passcode (see supabase_setup.sql).
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://xwyxgjxeorfuuueyqrte.supabase.co")  # Supabase project "Tenders"
@@ -51,27 +51,33 @@ SECTOR = {"council": 15, "borough": 15, "county": 15, "city of": 15, "nhs": 15, 
           "college": 13, "university": 13, "fire and rescue": 12, "police": 10, "ministry of defence": 9}
 
 
-def get(url, params, session):
-    forbidden = 0
-    for attempt in range(10):
+def get(url, params, session, tries=4):
+    """Fetch JSON with a few quick retries. Errors that won't fix themselves (SSL, 404) fail at once."""
+    forbidden, last = 0, ""
+    for attempt in range(tries):
         try:
-            r = session.get(url, params=params, headers=UA, timeout=90)
-        except requests.RequestException as e:      # timeouts / connection resets: back off and retry
-            print(f"  network error ({e.__class__.__name__}), retry {attempt + 1}", file=sys.stderr)
-            time.sleep(5 * (attempt + 1)); continue
+            r = session.get(url, params=params, headers=UA, timeout=60)
+        except requests.exceptions.SSLError as e:      # certificate problem: retrying never helps
+            raise RuntimeError(f"SSL error: {str(e)[:160]}")
+        except requests.RequestException as e:         # timeouts / connection resets: short back-off
+            last = f"{e.__class__.__name__}: {str(e)[:120]}"
+            print(f"  network error ({last}), retry {attempt + 1}/{tries}", file=sys.stderr)
+            time.sleep(10 * (attempt + 1)); continue
         if r.status_code == 200:
             try:
                 return r.json()
             except ValueError:
-                time.sleep(5); continue
-        if r.status_code == 403:      # rate limit: wait 5 minutes (Contracts Finder asks for this)
+                last = "response was not JSON"; time.sleep(5); continue
+        if r.status_code == 403:      # Contracts Finder rate limit: it asks for a 5 minute wait
             forbidden += 1
-            if forbidden > 12: break
+            if forbidden > 3: break
             print("  rate limited (403), waiting 5 min", file=sys.stderr); time.sleep(300); continue
-        if r.status_code in (429, 500, 502, 503, 504):
-            time.sleep(int(r.headers.get("Retry-After", 10)) + 5 * attempt); continue
+        if r.status_code in (429, 500, 502, 503, 504):  # Find a Tender allows 12 requests per 2 minutes
+            wait = int(r.headers.get("Retry-After", 30)) + 10 * attempt
+            last = f"HTTP {r.status_code}"
+            print(f"  HTTP {r.status_code}, waiting {wait}s", file=sys.stderr); time.sleep(wait); continue
         r.raise_for_status()
-    raise RuntimeError("gave up after retries: " + url[:120])
+    raise RuntimeError(f"gave up after {tries} tries ({last or 'rate limited'}): " + url[:120])
 
 
 def next_link(data):
@@ -116,7 +122,7 @@ def month_list(n):
     return out
 
 
-def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None):
+def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None, info=None, pause=0.4):
     """Walk the API's own paging links from newest to oldest until releases are older than cutoff."""
     url, params, pages = base, first_params, 0
     while pages < max_pages and (deadline is None or time.time() < deadline):
@@ -140,7 +146,7 @@ def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None
         if dates and max(dates)[:10] < cutoff.strftime("%Y-%m-%d"):
             return                       # whole page older than the look-back
         url, params = nxt, None
-        time.sleep(0.4)
+        time.sleep(pause)
 
 
 def parse_dt(s):
@@ -382,7 +388,7 @@ def run(days, outdir):
     s = requests.Session()
     best, seen_ids, scanned, ok = {}, set(), 0, 0
     counts, failed, watch, infos, known = {}, 0, [], {}, []
-    deadline = time.time() + 5 * 3600
+    deadline = time.time() + 150 * 60   # stop walking feeds after 2.5 hours so the run always finishes and publishes
 
     def consider(rel, portal):
         nonlocal scanned
@@ -416,7 +422,9 @@ def run(days, outdir):
     errors = []
     cf_common = {"publishedFrom": cutoff.strftime("%Y-%m-%dT00:00:00"),
                  "publishedTo": now.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 100}
-    feeds = [("Find a Tender", FTS_BASE, {"limit": 100}, "Find a Tender"),
+    fts_from = (now - timedelta(days=min(days, 120))).strftime("%Y-%m-%dT00:00:00")
+    feeds = [("Find a Tender", FTS_BASE, {"limit": 100, "stages": "planning,tender", "updatedFrom": fts_from,
+                                          "updatedTo": now.strftime("%Y-%m-%dT%H:%M:%S")}, "Find a Tender"),
              ("Contracts Finder (tender)", CF_BASE, dict(cf_common, stages="tender"), "Contracts Finder"),
              ("Contracts Finder (planning)", CF_BASE, dict(cf_common, stages="planning"), "Contracts Finder")]
     for label, base, params, portal in feeds:
@@ -424,7 +432,8 @@ def run(days, outdir):
         info = infos.setdefault(label, {})
         n0 = scanned
         try:
-            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info):
+            pause = 10.5 if portal == "Find a Tender" else 0.4   # Find a Tender: max 12 requests per 2 minutes
+            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info, pause=pause):
                 consider(rel, portal)
             ok += 1
         except Exception as e:
@@ -439,24 +448,35 @@ def run(days, outdir):
                                 ("Sell2Wales", S2W_BASE, "Sell2Wales")):
         n0 = scanned
         info = infos.setdefault(label, {"pages": 0})
+        fails = 0
         for nt in (2, 102, 1, 101):          # contract notice, site contract notice, prior info, site prior info
             for mm in month_list(6):
+                if fails >= 2:               # portal is down or unreachable: skip the rest rather than waste hours
+                    break
                 try:
-                    data = get(base, {"dateFrom": mm, "noticeType": nt, "outputType": 0}, s)
+                    q = {"dateFrom": mm, "noticeType": nt, "outputType": 0}
+                    if portal == "Sell2Wales": q["locale"] = 2057     # English
+                    data = get(base, q, s, tries=2)
                     rels = extract_releases(data)
-                    info["pages"] += 1
+                    info["pages"] += 1; fails = 0
                     for rel in rels:
                         consider(rel, portal)
                 except Exception as e:
-                    if len(errors) < 12: errors.append(f"{label} type {nt} month {mm}: {str(e)[:90]}")
+                    fails += 1
+                    errors.append(f"{label} type {nt} month {mm}: {str(e)[:200]}")
+                    print(f"  {label} type {nt} month {mm} failed: {str(e)[:200]}", file=sys.stderr)
                 time.sleep(0.5)
+        if fails >= 2:
+            failed += 1
+            errors.append(f"{label}: skipped after 2 failures in a row")
         counts[label] = scanned - n0
         print(f"  {label}: {scanned - n0} releases", file=sys.stderr)
 
     # notices you named: fetch directly so they can never be missed by the feed walk
     for nid in KNOWN:
         try:
-            data = get(f"{FTS_BASE}/{nid}", None, s)
+            time.sleep(10.5)                 # stay inside Find a Tender's rate limit
+            data = get(f"{FTS_BASE}/{nid}", None, s, tries=2)
             rels = data.get("releases", [])
             for rel in rels:
                 consider(rel, "Find a Tender")
