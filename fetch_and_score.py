@@ -108,6 +108,8 @@ def get(url, params, session, tries=4):
         if r.status_code in (429, 500, 502, 503, 504):  # Find a Tender allows 12 requests per 2 minutes
             wait = int(r.headers.get("Retry-After", 30)) + 10 * attempt
             last = f"HTTP {r.status_code}"
+            if attempt == tries - 1:
+                break
             print(f"  HTTP {r.status_code}, waiting {wait}s", file=sys.stderr); time.sleep(wait); continue
         r.raise_for_status()
     raise RuntimeError(f"gave up after {tries} tries ({last or 'rate limited'}): " + url[:120])
@@ -174,9 +176,11 @@ def walk_feed(base, first_params, session, cutoff, max_pages=8000, deadline=None
         yield from rels
         nxt = next_link(data)
         if not nxt or not rels:
+            if info is not None: info["stop"] = "end of feed"
             return
         dates = [r.get("date", "") for r in rels if r.get("date")]
         if dates and max(dates)[:10] < cutoff.strftime("%Y-%m-%d"):
+            if info is not None: info["stop"] = "reached look-back date"
             return                       # whole page older than the look-back
         url, params = nxt, None
         time.sleep(pause)
@@ -533,7 +537,7 @@ def render(rows, stats, updated, diag=None, renewals=None):
         wl = "".join(f"<li><b>{E(w['buyer'])}</b> - {E(w['title'])} [{E(w['stage'])}, {E(w['date'][:10])}] "
                      f"<a href=\"{E(w['url'])}\" target=\"_blank\">notice</a></li>" for w in diag["watch"][:80]) or "<li>None of the watched buyers appeared in the feeds.</li>"
         err_html = "".join(f"<li>{E(x)}</li>" for x in diag.get("errors", [])) or "<li>none</li>"
-        info_html = "".join(f"<li>{E(k)}: {v.get('pages', 0)} pages, oldest release {E(str(v.get('oldest', ''))[:10])}, tags {E(str(v.get('tags', {})))}</li>" for k, v in diag["infos"].items())
+        info_html = "".join(f"<li>{E(k)}: {v.get('pages', 0)} pages, stopped: {E(str(v.get('stop', 'time limit or error')))}, oldest release {E(str(v.get('oldest', ''))[:10])}, tags {E(str(v.get('tags', {})))}</li>" for k, v in diag["infos"].items())
         known_html = "".join(f"<li>{E(k['id'])} - {E(k['title'])} [{E(k['tags'])}] - {E(k['result'])}</li>" for k in diag["known"]) or "<li>none</li>"
         diag_html = (f"<details style='margin-top:24px'><summary><b>Diagnostics</b> (for checking coverage)</summary>"
                      f"<p>Failed feeds: {diag['failed']}</p><ul>{cnt}</ul>"
@@ -634,8 +638,11 @@ def run(days, outdir):
     cf_common = {"publishedFrom": cutoff.strftime("%Y-%m-%dT00:00:00"),
                  "publishedTo": now.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 100}
     fts_from = (now - timedelta(days=min(days, 120))).strftime("%Y-%m-%dT00:00:00")
-    feeds = [("Find a Tender", FTS_BASE, {"limit": 100, "stages": "planning,tender", "updatedFrom": fts_from,
-                                          "updatedTo": now.strftime("%Y-%m-%dT%H:%M:%S")}, "Find a Tender"),
+    fts_to = now.strftime("%Y-%m-%dT%H:%M:%S")
+    feeds = [("Find a Tender (tender)", FTS_BASE, {"limit": 100, "stages": "tender", "updatedFrom": fts_from, "updatedTo": fts_to},
+              "Find a Tender"),
+             ("Find a Tender (planning)", FTS_BASE, {"limit": 100, "stages": "planning", "updatedFrom": fts_from, "updatedTo": fts_to},
+              "Find a Tender"),
              ("Contracts Finder (tender)", CF_BASE, dict(cf_common, stages="tender"), "Contracts Finder"),
              ("Contracts Finder (planning)", CF_BASE, dict(cf_common, stages="planning"), "Contracts Finder")]
     for label, base, params, portal in feeds:
@@ -667,13 +674,14 @@ def run(days, outdir):
                 try:
                     q = {"dateFrom": mm, "noticeType": nt, "outputType": 0}
                     if portal == "Sell2Wales": q["locale"] = 2057     # English
-                    data = get(base, q, s, tries=2)
+                    data = get(base, q, s, tries=1)
                     rels = extract_releases(data)
                     info["pages"] += 1; fails = 0
                     for rel in rels:
                         consider(rel, portal)
                 except Exception as e:
-                    fails += 1
+                    if "HTTP 5" not in str(e):   # their server bug on one request: skip it, keep going
+                        fails += 1
                     errors.append(f"{label} type {nt} month {mm}: {str(e)[:200]}")
                     print(f"  {label} type {nt} month {mm} failed: {str(e)[:200]}", file=sys.stderr)
                 time.sleep(0.5)
