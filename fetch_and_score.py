@@ -13,7 +13,7 @@ so everyone with the team passcode sees the same picture. One-off setup: run sup
 in Supabase, then set SUPABASE_URL and SUPABASE_ANON_KEY (repo secrets, or edit the constants below).
 Without them the toggles still work but only save in each person's own browser.
 """
-import argparse, csv, html, json, os, sys, time
+import argparse, csv, html, json, os, re, sys, time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -36,12 +36,43 @@ KW_MED = ["electrical compliance", "electrical safety", "electrical testing", "e
           "periodic inspection and testing", "periodic electrical", "statutory electrical",
           "electrical certification", "rcd testing", "bs 7671", "bs7671",
           "electrical remedial", "electrical statutory", "electrical maintenance"]
+# Wider Fused services (remedials, installations, voltage optimisation / PFC, electrical maintenance)
+KW_SERVICES = ["electrical installation work", "electrical installations", "electrical installation contract",
+               "rewire", "rewiring", "electrical upgrade", "electrical works", "electrical services contract",
+               "electrical term contract", "electrical contractor", "electrical repairs",
+               "voltage optimisation", "voltage optimization", "voltage optimiser", "power factor correction",
+               "power factor", "electrical maintenance", "electrical planned maintenance",
+               "mechanical and electrical maintenance", "mechanical & electrical maintenance", "m&e maintenance",
+               "m & e maintenance", "m&e services", "building services maintenance"]
+# Broad phrases that only count when the notice is clearly electrical (the word "electric" appears)
+KW_CONTEXT = ["remedial works", "remedials", "statutory compliance", "compliance testing", "statutory testing",
+              "planned preventative maintenance", "ppm", "hard fm", "landlord compliance", "building compliance",
+              "lightning protection", "thermographic", "thermal imaging survey"]
 KW_LOW = []
 EV_WORDS = ["ev charg", "electric vehicle charg", "charge point", "chargepoint", "charging point", "ev infrastructure"]
 EV_ACTIONS = ["inspect", "testing", "periodic", "maintenance", "compliance", "certif"]
-# CPV codes only add confidence to a keyword match; they never trigger a match alone.
+# CPV codes add confidence to a keyword match. Codes in CPV_TRIGGER can also find a notice on their own
+# (e.g. a "Compliance framework" whose title never says "electrical"); those matches are capped at P3.
 CPV_HIGH = {"71631000", "71630000"}
 CPV_MED = {"50711000", "71314100", "45310000"}
+CPV_TRIGGER = {
+    "50711000": "repair and maintenance of electrical building installations",
+    "71314100": "electrical services",
+    "45310000": "electrical installation work",
+    "45311000": "electrical wiring and fitting work",
+    "45311100": "electrical wiring work",
+    "45311200": "electrical fitting work",
+    "45317000": "other electrical installation work",
+    "71631100": "technical inspection services (machinery/installations)",
+    "71632000": "technical testing services",
+    "31518200": "emergency lighting equipment",
+    "31527260": "lighting systems",
+    "50532000": "repair and maintenance of electrical machinery",
+    "71334000": "mechanical and electrical engineering services",
+    "45315600": "low-voltage installation work",
+    "31600000": "electrical equipment and apparatus",
+}
+EXCLUDE_TITLE = re.compile(r"\b(trainer|training|lease|back office|software|licen[cs]e|licensing|consultancy|calibration)\b")
 WATCH = ["london and quadrant", "london & quadrant", "mid and south essex", "gloucestershire county",
          "rochdale boroughwide", "kirklees"]
 KNOWN = ["085363-2026", "089933-2026", "089937-2026", "090449-2026", "091974-2026", "094380-2026",
@@ -170,18 +201,20 @@ def score(rel, portal, now):
     if c and c.get("scheme") == "CPV":
         cpvs.append((c["id"], c.get("description", "")))
     for it in t.get("items", []) or []:
-        for ac in it.get("additionalClassifications", []) or []:
-            if ac.get("scheme") == "CPV":
+        for ac in [it.get("classification") or {}] + (it.get("additionalClassifications", []) or []):
+            if ac.get("scheme") == "CPV" and ac.get("id"):
                 cpvs.append((ac["id"], ac.get("description", "")))
 
     kw, ev = 0, []
     tl = title.lower()
     lot_titles = " | ".join((l.get("title") or "") for l in (t.get("lots") or [])).lower()
-    body = "\n".join(parts[1:]).lower()[:8000]
-    # skip notices that are clearly something else (training courses, property leases, software)
-    if any(x in tl for x in ("trainer", "training", "lease", "units ", "back office", "software", "licence", "licensing", "consultancy", "calibration")):
+    body = "\n".join(parts[1:]).lower()[:40000]
+    # skip notices that are clearly something else (training courses, leases, software) - unless the title
+    # itself names one of our core services (e.g. "EICR and PAT testing incl. staff training" is kept)
+    if EXCLUDE_TITLE.search(tl) and not any(k in tl for k in KW_HIGH):
         return None
-    for lst, pts in ((KW_HIGH, 30), (KW_MED, 22)):
+    electrical = "electric" in text
+    for lst, pts in ((KW_HIGH, 30), (KW_MED, 22), (KW_SERVICES, 20), (KW_CONTEXT if electrical else [], 16)):
         for k in lst:
             if k in tl:
                 kw = max(kw, pts); ev.append(k + " (in title)")
@@ -194,7 +227,11 @@ def score(rel, portal, now):
             kw = max(kw, full); ev.append("EV charge point inspection/maintenance")
             break
     if kw == 0:
-        return None
+        trig = [(c, d) for c, d in cpvs if c in CPV_TRIGGER]
+        if not trig:
+            return None
+        kw = 14                                   # classification-only match: shown, but never above P3
+        ev += [f"CPV {c} {d or CPV_TRIGGER[c]} (classification only)" for c, d in trig]
     for code, d in cpvs:
         if code in CPV_HIGH or code in CPV_MED:
             ev.append(f"CPV {code} {d}"); kw = min(30, kw + 2)
@@ -359,7 +396,7 @@ header{{background:linear-gradient(135deg,#0f2540,#16324f);color:#fff;padding:26
 .login{{display:none;gap:8px;align-items:center;flex-wrap:wrap;background:#fff8f1;border:1px solid #f3c9a8;border-radius:10px;padding:12px 16px;margin-bottom:16px;font-size:13px}}
 .login input{{padding:6px 12px;border:1px solid var(--b);border-radius:20px;font-size:13px}}.login button{{background:var(--navy);color:#fff;border:0;border-radius:20px;padding:7px 16px;cursor:pointer}}.login span{{color:var(--m);font-size:12px}}
 .frow{{margin-bottom:10px}}.frow .fl{{font-size:12px;color:var(--m);text-transform:uppercase;margin-right:8px}}.foot{{font-size:12.5px;color:var(--m);margin-top:30px;line-height:1.6}}</style></head><body>
-<header><h1>FUSED Tender Intelligence</h1><p>PAT, EICR, fixed wire, electrical compliance, EV inspection and emergency lighting opportunities from Find a Tender and Contracts Finder. Updated daily. Last refresh: {updated}.</p></header>
+<header><h1>FUSED Tender Intelligence</h1><p>PAT, EICR, fixed wire, emergency lighting, EV inspection, remedials, installations, voltage optimisation and electrical maintenance opportunities from Find a Tender, Contracts Finder, Public Contracts Scotland and Sell2Wales. Updated daily. Last refresh: {updated}.</p></header>
 <div class="wrap"><div class="stats">
 <div class="stat"><div class="n">{len(rows)}</div><div class="l">Opportunities</div></div>
 <div class="stat"><div class="n">{stats['P1']}</div><div class="l">P1</div></div>
