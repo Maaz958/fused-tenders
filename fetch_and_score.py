@@ -450,8 +450,8 @@ def scan_awards(session, frm, to, now, deadline=None, errors=None, infos=None):
     for label, base, params, portal, pause in feeds:
         n, info = 0, (infos.setdefault(label, {}) if infos is not None else {})
         try:
-            for rel in walk_feed(base, params, session, frm, deadline=deadline, info=info, pause=pause,
-                                 date_stop=portal != "Find a Tender"):
+            # keep the look-back stop here: Find a Tender sometimes ignores the month window on award notices
+            for rel in walk_feed(base, params, session, frm, deadline=deadline, info=info, pause=pause):
                 n += 1
                 try:
                     for row in renewals_from(rel, portal, now):
@@ -473,6 +473,7 @@ def backfill_renewals(start=None, stop="2021-01"):
     if not SUPABASE_SERVICE_KEY:
         sys.exit("SUPABASE_SERVICE_KEY is not set - add it as a GitHub secret first.")
     now = datetime.now(timezone.utc)
+    resume = not start          # only the automatic backfill moves the saved resume point
     if not start:
         st = sb_select("app_state?key=eq.backfill_next&select=value")
         start = st[0]["value"] if st else now.strftime("%Y-%m")
@@ -495,7 +496,8 @@ def backfill_renewals(start=None, stop="2021-01"):
         total += len(rows)
         y, mth = (y - 1, 12) if mth == 1 else (y, mth - 1)
         nxt = f"{y:04d}-{mth:02d}" if f"{y:04d}-{mth:02d}" >= stop else "done"
-        sb_upsert("app_state", [dict(key="backfill_next", value=nxt, updated_at=now.isoformat())], conflict="key")
+        if resume:
+            sb_upsert("app_state", [dict(key="backfill_next", value=nxt, updated_at=now.isoformat())], conflict="key")
         print(f"Month {frm:%Y-%m} done: {len(rows)} renewals saved (total {total}). Next: {nxt}", file=sys.stderr)
     print(f"Backfill finished this run: {total} renewals saved.", file=sys.stderr)
 
