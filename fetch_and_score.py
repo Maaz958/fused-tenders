@@ -642,22 +642,20 @@ def run(days, outdir):
     errors = []
     cf_common = {"publishedFrom": cutoff.strftime("%Y-%m-%dT00:00:00"),
                  "publishedTo": now.strftime("%Y-%m-%dT%H:%M:%S"), "limit": 100}
-    fts_from = (now - timedelta(days=min(days, 120))).strftime("%Y-%m-%dT00:00:00")
+    # Find a Tender: read every notice updated in the look-back and filter locally. Its own "stages" filter
+    # returns only ~1,000 notices over 4 months versus 15,000+ tender/planning releases in the full feed.
+    fts_from = cutoff.strftime("%Y-%m-%dT00:00:00")
     fts_to = now.strftime("%Y-%m-%dT%H:%M:%S")
-    feeds = [("Find a Tender (tender)", FTS_BASE, {"limit": 100, "stages": "tender", "updatedFrom": fts_from, "updatedTo": fts_to},
-              "Find a Tender"),
-             ("Find a Tender (planning)", FTS_BASE, {"limit": 100, "stages": "planning", "updatedFrom": fts_from, "updatedTo": fts_to},
-              "Find a Tender"),
-             ("Contracts Finder (tender)", CF_BASE, dict(cf_common, stages="tender"), "Contracts Finder"),
-             ("Contracts Finder (planning)", CF_BASE, dict(cf_common, stages="planning"), "Contracts Finder")]
+    feeds = [("Contracts Finder (tender)", CF_BASE, dict(cf_common, stages="tender"), "Contracts Finder"),
+             ("Contracts Finder (planning)", CF_BASE, dict(cf_common, stages="planning"), "Contracts Finder"),
+             ("Find a Tender", FTS_BASE, {"limit": 100, "updatedFrom": fts_from, "updatedTo": fts_to}, "Find a Tender")]
     for label, base, params, portal in feeds:
         print(f"{label}: walking feed", file=sys.stderr)
         info = infos.setdefault(label, {})
         n0 = scanned
         try:
-            fts = portal == "Find a Tender"
-            pause = 10.5 if fts else 0.4   # Find a Tender: max 12 requests per 2 minutes
-            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info, pause=pause, date_stop=not fts):
+            pause = 10.5 if portal == "Find a Tender" else 0.4   # Find a Tender: max 12 requests per 2 minutes
+            for rel in walk_feed(base, params, s, cutoff, deadline=deadline, info=info, pause=pause):
                 consider(rel, portal)
             ok += 1
         except Exception as e:
